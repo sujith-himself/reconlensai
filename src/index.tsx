@@ -28,21 +28,15 @@ export const Route = createFileRoute("/")({
 
 function App() {
   const [view, setView] = useState<View>("analyze");
-  // URL to rescan when navigating from history — also used as key to force AnalyzeView remount
-  const [rescanUrl, setRescanUrl] = useState<string | undefined>(undefined);
+  const [pendingUrl, setPendingUrl] = useState<string | undefined>(undefined);
 
   const handleRescan = (url: string) => {
-    // Use a unique key by appending timestamp so repeated rescans of the same URL
-    // still force a fresh mount of AnalyzeView
-    setRescanUrl(url);
+    setPendingUrl(url);
     setView("analyze");
   };
 
   const handleNavigate = (v: View) => {
-    if (v !== "analyze") {
-      // Clear rescanUrl when leaving analyze so returning doesn't auto-scan
-      setRescanUrl(undefined);
-    }
+    if (v === "analyze") setPendingUrl(undefined);
     setView(v);
   };
 
@@ -52,9 +46,9 @@ function App() {
       <main className="md:pl-[260px]">
         {view === "analyze" && (
           <AnalyzeView
-            key={rescanUrl ?? "default"}
+            key={pendingUrl ?? "fresh"} // remount when rescan target changes
             onNavigate={handleNavigate}
-            initialUrl={rescanUrl}
+            initialUrl={pendingUrl}
           />
         )}
         {view === "history" && <HistoryView onRescan={handleRescan} />}
