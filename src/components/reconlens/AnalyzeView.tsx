@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { marked } from "marked";
 import {
   AlertTriangle,
   ArrowRight,
@@ -37,13 +38,18 @@ import {
   ExternalLink,
   ShieldX,
   Wifi,
+  History,
+  Link2,
+  Key,
+  MapPin,
+  Printer,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
-import { analyzeTarget, type AnalyzeResult, type SensitivePath, type CookieResult, type ClientRisk, type CommentLeak, type HiddenField, type OsintResult, type DNSRecords, generateHeaderExplanation, triageSubdomains, analyzeCookiesAI, generateFullReport } from "@/lib/analyzeServer";
+import { analyzeTarget, type AnalyzeResult, type SensitivePath, type CookieResult, type ClientRisk, type CommentLeak, type HiddenField, type OsintResult, type DNSRecords, generateHeaderExplanation, triageSubdomains, analyzeCookiesAI, generateFullReport, analyzeVulnerabilities, askPentestAssistant } from "@/lib/analyzeServer";
 import { getHistory, saveToHistory } from "@/lib/storage";
 import type { View } from "./types";
 
@@ -240,6 +246,10 @@ export function AnalyzeView({
           onNavigate={onNavigate}
           onAnalyzeUrl={startAnalysis}
         />
+      )}
+      
+      {result && !loading && (
+        <ChatWidget summary={result.summary} />
       )}
 
       <Footer />
@@ -538,8 +548,8 @@ function ResultsDashboard({
 
         <div className="p-6">
           {tab === "overview" && <OverviewPanel result={result} />}
-          {tab === "headers" && <HeadersTable headers={result.headers} />}
-          {tab === "tech" && <TechGrid items={result.technologies} />}
+          {tab === "headers" && <HeadersTable headers={result.securityHeaders} />}
+          {tab === "tech" && <TechGrid items={result.technologies} target={result.target} />}
           {tab === "recs" && <RecsList items={result.recommendations} target={result.target} technologies={result.technologies.map(t => t.name)} />}
           {tab === "recon" && <ReconPanel result={result} />}
           {tab === "osint" && <OsintPanel osint={result.osint} onAnalyzeSubdomain={(sub) => { setTab("overview" as TabId); onAnalyzeUrl(sub); }} />}
@@ -636,7 +646,7 @@ function StatusTimeline() {
 }
 
 function KpiStrip({ result }: { result: AnalyzeResult }) {
-  const missing = result.headers.filter((h) => h.status !== "ok").length;
+  const missing = result.securityHeaders.filter((h) => h.status !== "ok").length;
   const foundPaths = result.sensitivePaths?.filter((p) => p.status === "found").length ?? 0;
   const tiles = [
     { label: "Security score", value: `${result.score}/100`, icon: Gauge, accent: "text-primary" },
@@ -711,7 +721,7 @@ function SummaryCard({ summary, result }: { summary: string; result: AnalyzeResu
   const wpFound = paths.some((p) => (p.path === "/wp-admin/" || p.path === "/wp-admin") && p.status === "found");
   const externalScripts = result.clientRisks?.find((r) => r.type === "external-script");
   const externalCount = externalScripts ? (externalScripts.detail?.split(", ").filter(Boolean).length ?? 0) : 0;
-  const missingHeaders = result.headers.filter((h) => h.status !== "ok").length;
+  const missingHeaders = result.securityHeaders.filter((h) => h.status !== "ok").length;
 
   const pills: { label: string; color: string }[] = [];
   if (gitFound) pills.push({ label: "Git Exposed", color: "bg-destructive/15 text-destructive border-destructive/30" });
@@ -777,7 +787,7 @@ function MiniTechCard({ items }: { items: { name: string; category: string }[] }
   );
 }
 
-function HeadersTable({ headers }: { headers: AnalyzeResult["headers"] }) {
+function HeadersTable({ headers }: { headers: AnalyzeResult["securityHeaders"] }) {
   return (
     <div className="overflow-hidden rounded-lg border border-border">
       <table className="w-full text-sm">
@@ -806,7 +816,22 @@ function HeadersTable({ headers }: { headers: AnalyzeResult["headers"] }) {
   );
 }
 
-function TechGrid({ items }: { items: { name: string; category: string; version?: string }[] }) {
+function TechGrid({ items, target }: { items: { name: string; category: string; version?: string }[], target: string }) {
+  const [cves, setCves] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const fetchCves = async () => {
+    setLoading(true);
+    try {
+      const res = await analyzeVulnerabilities({ data: { technologies: items, target } as never });
+      setCves(res.analysis);
+    } catch {
+      setCves("Error fetching CVEs.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
   if (items.length === 0) {
     return (
       <div className="flex flex-col items-center gap-3 py-10 text-center">
@@ -818,24 +843,148 @@ function TechGrid({ items }: { items: { name: string; category: string; version?
     );
   }
   return (
-    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-      {items.map((t) => (
-        <div key={t.name} className="flex items-center gap-3 rounded-lg border border-border bg-card px-4 py-3">
-          <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-primary/10 text-primary">
-            <Cpu className="h-4 w-4" />
-          </div>
-          <div className="min-w-0">
-            <div className="truncate text-[14px] font-medium text-foreground">
-              {t.name}
-              {t.version && (
-                <span className="ml-1.5 text-[11px] font-normal text-muted-foreground">v{t.version}</span>
-              )}
+    <div className="space-y-6">
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+        {items.map((t) => (
+          <div key={t.name} className="flex items-center gap-3 rounded-lg border border-border bg-card px-4 py-3">
+            <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-primary/10 text-primary">
+              <Cpu className="h-4 w-4" />
             </div>
-            <div className="truncate text-[12px] text-muted-foreground">{t.category}</div>
+            <div className="min-w-0">
+              <div className="truncate text-[14px] font-medium text-foreground">
+                {t.name}
+                {t.version && (
+                  <span className="ml-1.5 text-[11px] font-normal text-muted-foreground">v{t.version}</span>
+                )}
+              </div>
+              <div className="truncate text-[12px] text-muted-foreground">{t.category}</div>
+            </div>
+          </div>
+        ))}
+      </div>
+      
+      <div className="mt-8 rounded-xl border border-border bg-card p-5">
+        <div className="flex items-center justify-between">
+          <div>
+            <h3 className="text-[14px] font-semibold flex items-center gap-2">
+              <ShieldAlert className="h-4 w-4 text-primary" /> Vulnerability & CVE Matching
+            </h3>
+            <p className="text-[12px] text-muted-foreground mt-1">Cross-reference the detected tech stack against known critical CVEs using AI.</p>
+          </div>
+          {!cves && (
+            <Button onClick={fetchCves} disabled={loading} size="sm" className="h-8 gap-2">
+              {loading ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+              {loading ? "Analyzing..." : "Find CVEs"}
+            </Button>
+          )}
+        </div>
+        
+        {cves && (
+          <div className="mt-4 rounded-lg bg-muted/50 p-4 border border-border">
+            <div
+              className="prose prose-sm prose-invert max-w-none text-[13px] leading-relaxed"
+              dangerouslySetInnerHTML={{ __html: marked(cves) as string }}
+            />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ChatWidget({ summary }: { summary: string }) {
+  const [open, setOpen] = useState(false);
+  const [messages, setMessages] = useState<{role: string, content: string}[]>([]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [messages, loading]);
+
+  const send = async () => {
+    if (!input.trim() || loading) return;
+    const userMsg = input;
+    setInput("");
+    const newHistory = [...messages, { role: "user", content: userMsg }];
+    setMessages(newHistory);
+    setLoading(true);
+    try {
+      const res = await askPentestAssistant({ data: { question: userMsg, scanSummary: summary, history: messages } as never });
+      setMessages([...newHistory, { role: "assistant", content: res.reply }]);
+    } catch {
+      setMessages([...newHistory, { role: "assistant", content: "Sorry, an error occurred while connecting to the AI." }]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <>
+      <button 
+        onClick={() => setOpen(!open)}
+        className="fixed bottom-6 right-6 h-14 w-14 rounded-full bg-primary text-primary-foreground shadow-lg shadow-primary/30 flex items-center justify-center hover:scale-105 transition-transform z-40"
+        title="AI Pentest Assistant"
+      >
+        <Sparkles className="h-6 w-6" />
+      </button>
+      {open && (
+        <div className="fixed bottom-24 right-6 w-96 max-w-[calc(100vw-3rem)] rounded-xl border border-border bg-background shadow-2xl overflow-hidden flex flex-col z-50 h-[520px] max-h-[calc(100vh-8rem)]">
+          <div className="flex items-center justify-between border-b border-border bg-muted/40 px-4 py-3 shrink-0">
+            <h3 className="font-semibold text-[14px] flex items-center gap-2"><Sparkles className="h-4 w-4 text-primary" /> AI Pentest Assistant</h3>
+            <button onClick={() => setOpen(false)} className="text-muted-foreground hover:text-foreground transition-colors"><XCircle className="h-5 w-5" /></button>
+          </div>
+          <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 space-y-3 text-[13px]">
+            {messages.length === 0 && (
+              <p className="text-muted-foreground text-center mt-10 text-[12px] leading-relaxed px-4">
+                Ask me anything about this scan. For example:<br/>
+                <span className="italic">"How do I exploit the missing CSP?"</span><br/>
+                <span className="italic">"Write a PoC for the cookie vulnerability."</span>
+              </p>
+            )}
+            {messages.map((m, i) => (
+              <div key={i} className={cn(
+                "p-3 rounded-xl max-w-[92%] break-words",
+                m.role === "user"
+                  ? "bg-primary text-primary-foreground ml-auto rounded-tr-sm text-[13px]"
+                  : "bg-muted text-foreground mr-auto rounded-tl-sm border border-border"
+              )}>
+                {m.role === "user" ? (
+                  <div className="whitespace-pre-wrap">{m.content}</div>
+                ) : (
+                  <div
+                    className="prose prose-sm prose-invert max-w-none text-[13px] leading-relaxed"
+                    dangerouslySetInnerHTML={{ __html: marked(m.content) as string }}
+                  />
+                )}
+              </div>
+            ))}
+            {loading && (
+              <div className="flex items-center gap-2 p-3 rounded-xl bg-muted text-muted-foreground mr-auto max-w-[80%] rounded-tl-sm border border-border">
+                <RefreshCw className="h-3.5 w-3.5 animate-spin shrink-0 text-primary" />
+                <span className="text-[12px]">ReconLens AI is thinking...</span>
+              </div>
+            )}
+          </div>
+          <div className="border-t border-border p-3 flex gap-2 bg-background shrink-0">
+            <input 
+              value={input} 
+              onChange={e => setInput(e.target.value)} 
+              onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+              placeholder={loading ? "Waiting for response..." : "Ask the assistant..."}
+              disabled={loading}
+              className="flex-1 rounded-md border border-border px-3 py-2 text-[13px] bg-background focus:outline-none focus:border-primary transition-colors disabled:opacity-50" 
+            />
+            <Button size="icon" onClick={send} disabled={loading} className="h-9 w-9 shrink-0">
+              {loading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}
+            </Button>
           </div>
         </div>
-      ))}
-    </div>
+      )}
+    </>
   );
 }
 
@@ -1528,7 +1677,7 @@ function OsintPanel({ osint, onAnalyzeSubdomain }: { osint?: OsintResult; onAnal
     );
   }
 
-  const { subdomains, dns, reverseIP, sharedHosting, wayback } = osint;
+  const { subdomains, dns, reverseIP, sharedHosting, wayback, ssl } = osint;
 
   const allDataEmpty =
     subdomains.length === 0 &&
@@ -1591,6 +1740,37 @@ function OsintPanel({ osint, onAnalyzeSubdomain }: { osint?: OsintResult; onAnal
 
   return (
     <div className="space-y-8">
+    
+      {/* Section 0 — SSL/TLS Details */}
+      {ssl?.hasSsl && (
+        <div>
+          <h3 className="mb-3 text-[13px] font-semibold uppercase tracking-wider text-muted-foreground">SSL / TLS Info</h3>
+          <div className="rounded-lg border border-border bg-background p-4 text-sm">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+              <div className="col-span-1 lg:col-span-2">
+                <span className="text-muted-foreground block text-xs mb-1">Issuer</span>
+                <p className="font-mono text-[13px] truncate" title={ssl.issuer || "Unknown"}>{ssl.issuer || "Unknown"}</p>
+              </div>
+              <div className="col-span-1 lg:col-span-2">
+                <span className="text-muted-foreground block text-xs mb-1">Expires</span>
+                <p className="font-mono text-[13px]">{ssl.validTo ? new Date(ssl.validTo).toLocaleString() : "Unknown"}</p>
+              </div>
+              {ssl.sans.length > 0 && (
+                <div className="col-span-1 sm:col-span-2 lg:col-span-4">
+                  <span className="text-muted-foreground block text-xs mb-1">Subject Alternative Names (SANs)</span>
+                  <div className="flex flex-wrap gap-1">
+                    {ssl.sans.map((san) => (
+                      <span key={san} className="inline-block rounded bg-muted px-2 py-1 text-[11px] font-mono">
+                        {san}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Section 1 — Subdomains */}
       <div>
@@ -1983,7 +2163,7 @@ function buildMarkdownReport(result: AnalyzeResult): string {
     ``,
     `| Header | Status | Description |`,
     `|--------|--------|-------------|`,
-    ...result.headers.map((h) => `| ${h.header} | ${h.status.toUpperCase()} | ${h.description} |`),
+    ...result.securityHeaders.map((h) => `| ${h.header} | ${h.status.toUpperCase()} | ${h.description} |`),
     ``,
     `## Technologies Detected`,
     ``,
@@ -2042,7 +2222,7 @@ function QuickActions({
       const res = await generateFullReport({ data: {
         target: result.target, score: result.score, risk: result.risk,
         endpoint: result.endpoint, technologies: result.technologies,
-        headers: result.headers, recommendations: result.recommendations,
+        headers: result.securityHeaders, recommendations: result.recommendations,
         sensitivePaths: result.sensitivePaths, cookies: result.cookies,
         osint: result.osint, summary: result.summary,
       } as never });
@@ -2078,6 +2258,9 @@ function QuickActions({
         </Button>
         <Button onClick={handleGenerateFullReport} variant="outline" className="h-10 gap-2 border-primary/30 text-primary hover:bg-primary/10">
           <Sparkles className="h-4 w-4" /> Generate AI Report
+        </Button>
+        <Button onClick={() => window.print()} variant="outline" className="h-10 gap-2 border-primary/30 text-primary hover:bg-primary/10">
+          <Printer className="h-4 w-4" /> Print PDF
         </Button>
         <div className="mx-1 hidden h-6 w-px bg-border sm:block" />
         <Button variant="outline" className="h-10 gap-2" onClick={copyReport}>

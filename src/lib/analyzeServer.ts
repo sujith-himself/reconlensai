@@ -1,5 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
 import { promises as dnsPromises } from "node:dns";
+import * as tls from "node:tls";
 
 /* ─── Types ─── */
 type HeaderStatus = "ok" | "warn" | "error";
@@ -78,12 +79,20 @@ export interface WaybackInfo {
   totalSnapshots: number | null;
 }
 
+export interface SslInfo {
+  hasSsl: boolean;
+  validTo: string | null;
+  issuer: string | null;
+  sans: string[];
+}
+
 export interface OsintResult {
   subdomains: Subdomain[];
   dns: DNSRecords;
   reverseIP: string[];
   sharedHosting: boolean;
   wayback: WaybackInfo;
+  ssl: SslInfo;
 }
 
 /* ─── Security header rules ─── */
@@ -228,7 +237,22 @@ function detectTechnologies(
   const powered = headers["x-powered-by"]?.toLowerCase() ?? "";
   const via = headers["via"]?.toLowerCase() ?? "";
 
-  if (headers["cf-ray"] || server.includes("cloudflare")) techs.push({ name: "Cloudflare", category: "CDN" });
+  if (headers["cf-ray"] || server.includes("cloudflare") || headers["set-cookie"]?.includes("__cfduid")) {
+    techs.push({ name: "Cloudflare", category: "WAF/CDN" });
+  }
+  if (headers["x-amzn-waf-action"] || (headers["x-amzn-trace-id"]?.includes("Root=") && server.includes("awselb"))) {
+    techs.push({ name: "AWS WAF", category: "WAF" });
+  }
+  if (headers["x-iinfo"] || headers["x-cdn"]?.includes("incapsula") || headers["set-cookie"]?.includes("incap_ses")) {
+    techs.push({ name: "Imperva", category: "WAF" });
+  }
+  if (headers["x-sucuri-id"] || server.includes("sucuri")) {
+    techs.push({ name: "Sucuri", category: "WAF" });
+  }
+  if (headers["x-akamai-request-id"] || server.includes("akamai")) {
+    techs.push({ name: "Akamai", category: "WAF/CDN" });
+  }
+
   if (server.includes("nginx")) techs.push({ name: "nginx", category: "Server" });
   if (server.includes("apache")) techs.push({ name: "Apache", category: "Server" });
   if (server.includes("iis") || server.includes("microsoft-iis")) techs.push({ name: "IIS", category: "Server" });
@@ -237,7 +261,7 @@ function detectTechnologies(
   if (headers["x-amz-request-id"] || headers["x-amz-id-2"]) techs.push({ name: "AWS", category: "Cloud" });
   if (headers["x-github-request-id"]) techs.push({ name: "GitHub", category: "Platform" });
   if (via.includes("varnish")) techs.push({ name: "Varnish", category: "Cache" });
-  if (headers["x-fastly-request-id"]) techs.push({ name: "Fastly", category: "CDN" });
+  if (headers["x-fastly-request-id"] && !techs.find(t => t.name === "Fastly")) techs.push({ name: "Fastly", category: "CDN" });
   if (powered.includes("php")) techs.push({ name: "PHP", category: "Language" });
   if (powered.includes("asp.net")) techs.push({ name: "ASP.NET", category: "Framework" });
   if (powered.includes("next.js")) techs.push({ name: "Next.js", category: "Framework" });
@@ -304,8 +328,37 @@ const SENSITIVE_PATHS: { path: string; label: string; severity: SensitivePath["s
 
 async function probeSensitivePaths(
   baseUrl: string,
+  technologies: { name: string; category: string }[],
 ): Promise<{ paths: SensitivePath[]; robotsDisallowed: string[] }> {
   const base = baseUrl.replace(/\/$/, "");
+  
+  // Dynamic Fuzzing Paths based on detected technologies
+  const techNames = technologies.map((t) => t.name.toLowerCase());
+  const pathsToCheck = [...SENSITIVE_PATHS];
+
+  if (techNames.includes("wordpress")) {
+    pathsToCheck.push(
+      { path: "/wp-config.php.bak", label: "WP Config Backup", severity: "critical" },
+      { path: "/wp-content/debug.log", label: "WP Debug Log", severity: "high" }
+    );
+  }
+  if (techNames.includes("node.js") || techNames.includes("react") || techNames.includes("next.js") || techNames.includes("vue.js")) {
+    pathsToCheck.push(
+      { path: "/package.json", label: "NPM Package config", severity: "medium" },
+      { path: "/.env", label: "Environment variables", severity: "critical" }
+    );
+  }
+  if (techNames.includes("php") || techNames.includes("apache") || techNames.includes("nginx")) {
+    pathsToCheck.push(
+      { path: "/phpinfo.php", label: "PHP Info page", severity: "high" },
+      { path: "/.htaccess", label: "Apache Config", severity: "high" }
+    );
+  }
+  // Generic tech checks
+  pathsToCheck.push(
+    { path: "/.git/config", label: "Exposed Git config", severity: "critical" },
+    { path: "/.aws/credentials", label: "Exposed AWS creds", severity: "critical" }
+  );
 
   const probeOne = async (
     entry: (typeof SENSITIVE_PATHS)[number],
@@ -327,7 +380,7 @@ async function probeSensitivePaths(
     }
   };
 
-  const paths = await Promise.all(SENSITIVE_PATHS.map(probeOne));
+  const paths = await Promise.all(pathsToCheck.map(probeOne));
 
   let robotsDisallowed: string[] = [];
   const robotsResult = paths.find((p) => p.path === "/robots.txt");
@@ -848,50 +901,115 @@ async function getWaybackInfo(domain: string): Promise<WaybackInfo> {
   }
 }
 
+async function fetchSSLDetails(domain: string): Promise<SslInfo> {
+  const empty: SslInfo = { hasSsl: false, validTo: null, issuer: null, sans: [] };
+  return new Promise((resolve) => {
+    let resolved = false;
+    const finish = (result: SslInfo) => {
+      if (!resolved) {
+        resolved = true;
+        resolve(result);
+      }
+    };
+    try {
+      const socket = tls.connect({
+        host: domain,
+        port: 443,
+        servername: domain,
+        rejectUnauthorized: false,
+      }, () => {
+        const cert = socket.getPeerCertificate();
+        if (cert && Object.keys(cert).length > 0) {
+          const sans = cert.subjectaltname
+            ? cert.subjectaltname.split(",").map(s => s.replace("DNS:", "").trim())
+            : [];
+          finish({
+            hasSsl: true,
+            validTo: cert.valid_to ?? null,
+            issuer: (Array.isArray(cert.issuer?.O) ? cert.issuer?.O[0] : cert.issuer?.O) ?? (Array.isArray(cert.issuer?.CN) ? cert.issuer?.CN[0] : cert.issuer?.CN) ?? null,
+            sans,
+          });
+        } else {
+          finish(empty);
+        }
+        socket.end();
+      });
+      socket.setTimeout(4000);
+      socket.on("timeout", () => { socket.destroy(); finish(empty); });
+      socket.on("error", () => finish(empty));
+    } catch {
+      finish(empty);
+    }
+  });
+}
+
 async function getOsintData(targetUrl: string, isLiveUrl: boolean): Promise<OsintResult> {
   const emptyDns: DNSRecords = { a: [], mx: [], txt: [], ns: [], aaaa: [], emailSpoofingRisk: "high", emailProvider: null };
-  const emptyOsint: OsintResult = { subdomains: [], dns: emptyDns, reverseIP: [], sharedHosting: false, wayback: { hasArchive: false, oldestSnapshot: null, latestSnapshot: null, totalSnapshots: null } };
+  const emptyOsint: OsintResult = { subdomains: [], dns: emptyDns, reverseIP: [], sharedHosting: false, wayback: { hasArchive: false, oldestSnapshot: null, latestSnapshot: null, totalSnapshots: null }, ssl: { hasSsl: false, validTo: null, issuer: null, sans: [] } };
   if (!isLiveUrl) return emptyOsint;
 
   const domain = extractBaseDomain(targetUrl);
   if (!domain) return emptyOsint;
 
-  const [subdomainsResult, dnsResult, waybackResult] = await Promise.allSettled([
+  const [subdomainsResult, dnsResult, waybackResult, sslResult] = await Promise.allSettled([
     findSubdomains(domain),
     getDNSRecords(domain),
     getWaybackInfo(domain),
+    fetchSSLDetails(domain)
   ]);
 
   const subdomains = subdomainsResult.status === "fulfilled" ? subdomainsResult.value : [];
   const dns = dnsResult.status === "fulfilled" ? dnsResult.value : emptyDns;
   const wayback = waybackResult.status === "fulfilled" ? waybackResult.value : emptyOsint.wayback;
+  const ssl = sslResult.status === "fulfilled" ? sslResult.value : emptyOsint.ssl;
 
-  const firstIP = dns.a[0] ?? "";
   let reverseIP: string[] = [];
-  if (firstIP) {
-    try { reverseIP = await getReverseIP(firstIP); } catch { reverseIP = []; }
+  const primaryIP = dns.a[0];
+  if (primaryIP) {
+    try {
+      reverseIP = await getReverseIP(primaryIP);
+    } catch {
+      reverseIP = [];
+    }
   }
-  const sharedHosting = reverseIP.length > 1;
 
-  return { subdomains, dns, reverseIP, sharedHosting, wayback };
+  const sharedHosting = reverseIP.length > 0;
+  
+  // Merge SANs into subdomains if they aren't already there
+  const seenSubs = new Set(subdomains.map(s => s.name));
+  for (const san of ssl.sans) {
+    const trimmed = san.replace(/^\*\./, "").toLowerCase();
+    if (!seenSubs.has(trimmed) && trimmed !== domain && trimmed.endsWith(domain)) {
+      subdomains.push({ name: trimmed, firstSeen: "SSL SAN", lastSeen: "SSL SAN" });
+      seenSubs.add(trimmed);
+    }
+  }
+
+  return { subdomains, dns, reverseIP, sharedHosting, wayback, ssl };
 }
 
 /* ─── AI helper: shared Groq caller ─── */
-async function callGroq(prompt: string, maxTokens = 512): Promise<string | null> {
+async function callGroq(
+  promptOrMessages: string | { role: string; content: string }[],
+  maxTokens = 512
+): Promise<string | null> {
   const key = process.env.GROQ_API_KEY;
   if (!key) return null;
   try {
+    const messages = typeof promptOrMessages === "string"
+      ? [{ role: "user", content: promptOrMessages }]
+      : promptOrMessages;
     const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: { "Authorization": `Bearer ${key}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         model: "qwen/qwen3-32b",
-        messages: [{ role: "user", content: prompt }],
+        messages,
         max_tokens: maxTokens,
         temperature: 0.3,
         reasoning_format: "hidden",
       }),
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(20000),
     });
     if (!res.ok) return null;
     const data = await res.json() as { choices?: { message?: { content?: string } }[] };
@@ -969,14 +1087,14 @@ export const generateFullReport = createServerFn({ method: "POST" }).handler(
     const scanData = rawData as unknown as {
       target: string; score: number; risk: string; endpoint: string;
       technologies: { name: string; category: string }[];
-      headers: { header: string; status: string; description: string }[];
+      securityHeaders: { header: string; status: string; description: string }[];
       recommendations: { title: string; detail: string }[];
       sensitivePaths?: { path: string; label: string; severity: string; status: string }[];
       cookies?: { name: string; httpOnly: boolean; secure: boolean; sameSite: string | null }[];
       osint?: { subdomains: { name: string }[] };
       summary: string;
     };
-    const issues = scanData.headers.filter((h) => h.status !== "ok");
+    const issues = scanData.securityHeaders.filter((h) => h.status !== "ok");
     const exposedPaths = (scanData.sensitivePaths ?? []).filter((p) => p.status === "found");
     const prompt = `You are a senior penetration tester writing a professional security assessment report.
 
@@ -1000,10 +1118,61 @@ Write a comprehensive security assessment report in markdown format with these s
 # Remediation Roadmap
 # Conclusion
 
-Be specific, technical, and actionable. Use proper markdown formatting.`;
+Make it professional, technical, and actionable. Use proper markdown formatting.`;
     const result = await callGroq(prompt, 1500);
     return { report: result ?? `# Security Assessment Report\n\n**Target:** ${scanData.target}\n**Score:** ${scanData.score}/100\n**Risk:** ${scanData.risk}\n\n## Summary\n\n${scanData.summary}` };
   },
+);
+
+
+export const analyzeVulnerabilities = createServerFn({ method: "POST" }).handler(
+  async ({ data: rawData }) => {
+    const { technologies, target } = rawData as unknown as { technologies: { name: string; category: string; version?: string }[]; target: string };
+    
+    if (technologies.length === 0) return { analysis: "No specific technologies detected to check for vulnerabilities." };
+    
+    const techString = technologies.map(t => `${t.name} ${t.version || "(version unknown)"}`).join(", ");
+    
+    const prompt = `You are an expert penetration tester. A scan of ${target} revealed the following technologies:
+${techString}
+
+List the top 3-5 most critical known vulnerabilities (CVEs) associated with these specific technologies and versions (if version is unknown, list the most common critical CVEs for the technology in general).
+For each, provide:
+1. The CVE ID
+2. A brief description of the vulnerability
+3. How an attacker might exploit it
+4. How to patch it
+
+Format this as a clean, readable Markdown response. Be technical and precise.`;
+    const result = await callGroq(prompt, 1024);
+    return { analysis: result };
+  }
+);
+
+export const askPentestAssistant = createServerFn({ method: "POST" }).handler(
+  async ({ data: rawData }) => {
+    const { question, scanSummary, history } = rawData as unknown as { 
+      question: string; 
+      scanSummary: string;
+      history: { role: string; content: string }[]
+    };
+    
+    const systemContent = `You are an expert penetration tester and security consultant. You are assisting a user in understanding and exploiting/remediating a security scan.
+
+Here is the summary of the scan results:
+${scanSummary}
+
+Answer the user's questions clearly, technically, and precisely. If they ask for proof-of-concept (PoC) code or specific remediation snippets, provide them in Markdown code blocks. Keep responses concise but highly technical. Never cut off mid-sentence — always complete your response.`;
+
+    const messages: { role: string; content: string }[] = [
+      { role: "system", content: systemContent },
+      ...history,
+      { role: "user", content: question },
+    ];
+    
+    const result = await callGroq(messages, 1024);
+    return { reply: result ?? "Error generating response." };
+  }
 );
 
 /* ─── Main server function ─── */
@@ -1086,19 +1255,59 @@ export const analyzeTarget = createServerFn({ method: "POST" }).handler(
     const isLiveUrl = targetUrl.startsWith("http") && !targetUrl.includes("Raw HTTP");
     // For raw HTTP, we still do passive DNS/subdomain using the host
     const osintTarget = isLiveUrl ? targetUrl : rawHttpHost ? `https://${rawHttpHost}` : "";
-    const [sensitivePathData, osint] = await Promise.all([
+    const technologies = detectTechnologies(rawHeaders, htmlBody);
+
+    const [sensitivePathData, osint, jsLeaks] = await Promise.all([
       isLiveUrl
-        ? probeSensitivePaths(targetUrl)
+        ? probeSensitivePaths(targetUrl, technologies)
         : Promise.resolve({ paths: [] as SensitivePath[], robotsDisallowed: [] as string[] }),
-      osintTarget ? getOsintData(osintTarget, true) : Promise.resolve({ subdomains: [], dns: { a: [], mx: [], txt: [], ns: [], aaaa: [], emailSpoofingRisk: "high" as const, emailProvider: null }, reverseIP: [], sharedHosting: false, wayback: { hasArchive: false, oldestSnapshot: null, latestSnapshot: null, totalSnapshots: null } }),
+      osintTarget ? getOsintData(osintTarget, true) : Promise.resolve({ subdomains: [], dns: { a: [], mx: [], txt: [], ns: [], aaaa: [], emailSpoofingRisk: "high" as const, emailProvider: null }, reverseIP: [], sharedHosting: false, wayback: { hasArchive: false, oldestSnapshot: null, latestSnapshot: null, totalSnapshots: null }, ssl: { hasSsl: false, validTo: null, issuer: null, sans: [] } }),
+      (async () => {
+        if (!isLiveUrl) return { comments: [], hiddenFields: [], internalIPs: [], emails: [] } as LeakResult;
+        const scriptMatch = htmlBody.match(/<script[^>]+src=["']([^"']+\.js[^"']*)["']/gi);
+        if (!scriptMatch) return { comments: [], hiddenFields: [], internalIPs: [], emails: [] };
+        
+        const urls = scriptMatch
+          .map(s => s.match(/src=["']([^"']+)["']/i)?.[1])
+          .filter(Boolean)
+          .map(u => u!.startsWith("http") ? u : (u!.startsWith("/") ? `${targetUrl.replace(/\/$/, "")}${u}` : `${targetUrl.replace(/\/$/, "")}/${u}`))
+          .slice(0, 3);
+          
+        const leakResults = await Promise.all(urls.map(async (u) => {
+          try {
+            const res = await fetch(u!, { signal: AbortSignal.timeout(3000) });
+            if (!res.ok) return null;
+            const text = await res.text();
+            return mineLeaks(text);
+          } catch {
+            return null;
+          }
+        }));
+        
+        const merged: LeakResult = { comments: [], hiddenFields: [], internalIPs: [], emails: [] };
+        for (const lr of leakResults) {
+          if (!lr) continue;
+          merged.comments.push(...lr.comments);
+          merged.hiddenFields.push(...lr.hiddenFields);
+          merged.internalIPs.push(...lr.internalIPs);
+          merged.emails.push(...lr.emails);
+        }
+        return merged;
+      })(),
     ]);
 
     const { paths: sensitivePaths, robotsDisallowed } = sensitivePathData;
     const cookies = parseCookies(rawHeaders);
     const clientRisks = analyzeClientRisks(htmlBody, targetUrl);
     const headers = runRuleEngine(rawHeaders);
-    const technologies = detectTechnologies(rawHeaders, htmlBody);
-    const leaks = mineLeaks(htmlBody);
+    
+    const htmlLeaks = mineLeaks(htmlBody);
+    const leaks: LeakResult = {
+      comments: [...htmlLeaks.comments, ...jsLeaks.comments],
+      hiddenFields: [...htmlLeaks.hiddenFields, ...jsLeaks.hiddenFields],
+      internalIPs: Array.from(new Set([...htmlLeaks.internalIPs, ...jsLeaks.internalIPs])),
+      emails: Array.from(new Set([...htmlLeaks.emails, ...jsLeaks.emails]))
+    };
     const score = calculateScore(headers, sensitivePaths, clientRisks, cookies, leaks, osint);
     const endpoint = classifyEndpoint(targetUrl, rawHeaders);
     const risk = score >= 85 ? "Low" : score >= 65 ? "Moderate" : score >= 40 ? "High" : "Critical";
@@ -1115,7 +1324,7 @@ export const analyzeTarget = createServerFn({ method: "POST" }).handler(
       endpoint,
       risk,
       technologies,
-      headers,
+      securityHeaders: headers,
       recommendations,
       summary,
       sensitivePaths,
@@ -1124,7 +1333,7 @@ export const analyzeTarget = createServerFn({ method: "POST" }).handler(
       robotsDisallowed,
       leaks,
       osint,
-      raw: { request: { method: "HEAD", url: targetUrl, protocol: "HTTP/2" }, response: { headers: rawHeaders }, fingerprint: {} },
+      raw: { request: { method: "HEAD", url: targetUrl, protocol: "HTTP/2" }, response: { rawHeaders: rawHeaders }, fingerprint: {} },
     };
   },
 );
