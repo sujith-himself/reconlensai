@@ -661,13 +661,33 @@ function mineLeaks(htmlBody: string): LeakResult {
   // ── 4. Email Addresses ──
   const emailsSet = new Set<string>();
   try {
-    const emailRe = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
-    const falsePositiveDomains = ["example.com", "domain.com", "email.com", "yourdomain.com"];
+    const falsePositiveDomains = new Set(["example.com", "domain.com", "email.com", "yourdomain.com", "sentry.io"]);
+
+    // Standard email pattern
+    const emailRe = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
     let em: RegExpExecArray | null;
     while ((em = emailRe.exec(htmlBody)) !== null) {
-      const email = em[0];
-      const domain = email.split("@")[1]?.toLowerCase() ?? "";
-      if (!falsePositiveDomains.includes(domain)) emailsSet.add(email);
+      const email = em[0].toLowerCase();
+      const domain = email.split("@")[1] ?? "";
+      if (!falsePositiveDomains.has(domain)) emailsSet.add(email);
+    }
+
+    // mailto: links  (catches encoded/nested ones too)
+    const mailtoRe = /mailto:([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/gi;
+    let mt: RegExpExecArray | null;
+    while ((mt = mailtoRe.exec(htmlBody)) !== null) {
+      const email = mt[1].toLowerCase();
+      const domain = email.split("@")[1] ?? "";
+      if (!falsePositiveDomains.has(domain)) emailsSet.add(email);
+    }
+
+    // Obfuscated  user [at] domain [dot] com  /  user(at)domain.com
+    const obfRe = /([a-zA-Z0-9._%+\-]+)\s*[\[(]\s*at\s*[\])]\s*([a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/gi;
+    let ob: RegExpExecArray | null;
+    while ((ob = obfRe.exec(htmlBody)) !== null) {
+      const email = `${ob[1]}@${ob[2]}`.toLowerCase();
+      const domain = email.split("@")[1] ?? "";
+      if (!falsePositiveDomains.has(domain)) emailsSet.add(email);
     }
   } catch { /* malformed HTML — skip */ }
 
@@ -1300,28 +1320,56 @@ export const analyzeTarget = createServerFn({ method: "POST" }).handler(
       osintTarget ? getOsintData(osintTarget, true) : Promise.resolve({ subdomains: [], dns: { a: [], mx: [], txt: [], ns: [], aaaa: [], emailSpoofingRisk: "high" as const, emailProvider: null }, reverseIP: [], sharedHosting: false, wayback: { hasArchive: false, oldestSnapshot: null, latestSnapshot: null, totalSnapshots: null }, ssl: { hasSsl: false, validTo: null, issuer: null, sans: [] } }),
       (async () => {
         if (!isLiveUrl) return { comments: [], hiddenFields: [], internalIPs: [], emails: [] } as LeakResult;
+
+        const base = targetUrl.replace(/\/$/, "");
+        const baseOrigin = (() => { try { return new URL(base).origin; } catch { return base; } })();
+
+        // ── Crawl same-domain internal pages (up to 8) ──
+        const internalPageRe = /href=["'](\/[^"'#?]*)["']/gi;
+        const priorityKeywords = /contact|faculty|staff|team|about|people|directory|member|employee|department|profile|faculty/i;
+        const crawlUrls = new Set<string>();
+        let hm: RegExpExecArray | null;
+        while ((hm = internalPageRe.exec(htmlBody)) !== null) {
+          const path = hm[1];
+          if (path && path !== "/") crawlUrls.add(`${baseOrigin}${path}`);
+        }
+        // Prioritise contact/people/faculty pages
+        const sorted = Array.from(crawlUrls).sort((a, b) => {
+          const aP = priorityKeywords.test(a) ? 0 : 1;
+          const bP = priorityKeywords.test(b) ? 0 : 1;
+          return aP - bP;
+        }).slice(0, 8);
+
+        const pageFetches = sorted.map(async (u) => {
+          try {
+            const res = await fetch(u, { signal: AbortSignal.timeout(4000), headers: { "User-Agent": "ReconLens/1.0" } });
+            if (!res.ok) return null;
+            const ct = res.headers.get("content-type") ?? "";
+            if (!ct.includes("text/html") && !ct.includes("text/plain")) return null;
+            const text = await res.text();
+            return mineLeaks(text);
+          } catch { return null; }
+        });
+
+        // ── JS file mining (up to 5 files) ──
         const scriptMatch = htmlBody.match(/<script[^>]+src=["']([^"']+\.js[^"']*)["']/gi);
-        if (!scriptMatch) return { comments: [], hiddenFields: [], internalIPs: [], emails: [] };
-        
-        const urls = scriptMatch
+        const jsUrls = (scriptMatch ?? [])
           .map(s => s.match(/src=["']([^"']+)["']/i)?.[1])
           .filter(Boolean)
-          .map(u => u!.startsWith("http") ? u : (u!.startsWith("/") ? `${targetUrl.replace(/\/$/, "")}${u}` : `${targetUrl.replace(/\/$/, "")}/${u}`))
-          .slice(0, 3);
-          
-        const leakResults = await Promise.all(urls.map(async (u) => {
+          .map(u => u!.startsWith("http") ? u : (u!.startsWith("/") ? `${base}${u}` : `${base}/${u}`))
+          .slice(0, 5);
+
+        const jsFetches = jsUrls.map(async (u) => {
           try {
             const res = await fetch(u!, { signal: AbortSignal.timeout(3000) });
             if (!res.ok) return null;
-            const text = await res.text();
-            return mineLeaks(text);
-          } catch {
-            return null;
-          }
-        }));
-        
+            return mineLeaks(await res.text());
+          } catch { return null; }
+        });
+
+        const allResults = await Promise.all([...pageFetches, ...jsFetches]);
         const merged: LeakResult = { comments: [], hiddenFields: [], internalIPs: [], emails: [] };
-        for (const lr of leakResults) {
+        for (const lr of allResults) {
           if (!lr) continue;
           merged.comments.push(...lr.comments);
           merged.hiddenFields.push(...lr.hiddenFields);
