@@ -88,15 +88,29 @@ bun install        # or: npm install
 
 ### Environment
 
-Create a `.env` file in the project root:
+Create a `.env` file in the project root. ReconLens supports **Groq** and **Google Gemini** as AI providers — set whichever key you have:
 
 ```env
-# Use either one (or both — Groq takes priority if both are set)
+# Option 1 — Groq (recommended, free at console.groq.com)
 GROQ_API_KEY=your_groq_api_key_here
+
+# Option 2 — Google Gemini (free at aistudio.google.com)
 GEMINI_API_KEY=your_gemini_api_key_here
+
+# Both keys can coexist — Groq takes priority when both are present
 ```
 
-> **Note:** The `.env` file is gitignored. Never commit API keys to version control. At least one AI key is required for AI-powered features (summaries, chat, explanations). Without any key the tool still runs with static fallback summaries.
+**Provider selection logic:**
+
+```
+GROQ_API_KEY present?   →  Groq  (qwen/qwen3-32b)
+         ↓ no
+GEMINI_API_KEY present? →  Gemini  (gemini-2.0-flash)
+         ↓ no
+                        →  Static fallback  (no AI features, rule-based output only)
+```
+
+> **Note:** `.env` is gitignored — never commit API keys. At least one key is required for AI-powered features (executive summary, pentest chat, header explanations, cookie analysis, vulnerability synthesis, full report export). The scanner itself works without any key.
 
 ### Development
 
