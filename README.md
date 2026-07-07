@@ -65,7 +65,7 @@ Designed to slot into existing SOC pipelines: ingest from triage queues, emit JS
 | **UI components** | Radix UI primitives + custom design system |
 | **Build tool** | Vite 8 |
 | **Language** | TypeScript 5.9 |
-| **AI** | Google Gemini (summarization, explanations, chat) |
+| **AI** | Groq API — `qwen/qwen3-32b` (summarization, explanations, chat) |
 | **Storage** | localStorage (per-workspace, client-side) |
 | **Package manager** | Bun |
 
@@ -76,7 +76,7 @@ Designed to slot into existing SOC pipelines: ingest from triage queues, emit JS
 ### Prerequisites
 
 - [Node.js](https://nodejs.org/) 20+ or [Bun](https://bun.sh/) 1.3+
-- A Google Gemini API key (set in `.env`)
+- A Groq API key (free at [console.groq.com](https://console.groq.com), set in `.env`)
 
 ### Installation
 
@@ -91,7 +91,7 @@ bun install        # or: npm install
 Create a `.env` file in the project root:
 
 ```env
-GEMINI_API_KEY=your_gemini_api_key_here
+GROQ_API_KEY=your_groq_api_key_here
 ```
 
 > **Note:** The `.env` file is gitignored. Never commit API keys to version control.
