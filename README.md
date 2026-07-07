@@ -65,7 +65,7 @@ Designed to slot into existing SOC pipelines: ingest from triage queues, emit JS
 | **UI components** | Radix UI primitives + custom design system |
 | **Build tool** | Vite 8 |
 | **Language** | TypeScript 5.9 |
-| **AI** | Groq API — `qwen/qwen3-32b` (summarization, explanations, chat) |
+| **AI** | Groq (`qwen/qwen3-32b`) or Google Gemini (`gemini-2.0-flash`) — auto-detected from env |
 | **Storage** | localStorage (per-workspace, client-side) |
 | **Package manager** | Bun |
 
@@ -76,7 +76,7 @@ Designed to slot into existing SOC pipelines: ingest from triage queues, emit JS
 ### Prerequisites
 
 - [Node.js](https://nodejs.org/) 20+ or [Bun](https://bun.sh/) 1.3+
-- A Groq API key (free at [console.groq.com](https://console.groq.com), set in `.env`)
+- An AI API key — either **Groq** (free at [console.groq.com](https://console.groq.com)) or **Gemini** (free at [aistudio.google.com](https://aistudio.google.com))
 
 ### Installation
 
@@ -91,10 +91,12 @@ bun install        # or: npm install
 Create a `.env` file in the project root:
 
 ```env
+# Use either one (or both — Groq takes priority if both are set)
 GROQ_API_KEY=your_groq_api_key_here
+GEMINI_API_KEY=your_gemini_api_key_here
 ```
 
-> **Note:** The `.env` file is gitignored. Never commit API keys to version control.
+> **Note:** The `.env` file is gitignored. Never commit API keys to version control. At least one AI key is required for AI-powered features (summaries, chat, explanations). Without any key the tool still runs with static fallback summaries.
 
 ### Development
 

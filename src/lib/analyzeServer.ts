@@ -541,8 +541,6 @@ async function generateAISummary(params: {
   target: string; score: number; risk: string; endpoint: string;
   technologies: { name: string; category: string }[]; headers: HeaderResult[];
 }): Promise<string> {
-  const key = process.env.GROQ_API_KEY;
-  if (!key) return buildFallbackSummary(params.target, params.score, params.risk, params.headers);
   const issues = params.headers.filter((h) => h.status !== "ok");
   const prompt = `You are a senior penetration tester writing an executive summary for a security assessment report.
 
@@ -560,31 +558,8 @@ Write a professional executive summary in 4-5 sentences covering:
 4. Top priority actions to take
 
 Be specific and technical. Plain text only, no markdown, no bullet points, no headers.`;
-  try {
-    const res = await fetch(
-      "https://api.groq.com/openai/v1/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${key}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: "qwen/qwen3-32b",
-          messages: [{ role: "user", content: prompt }],
-          max_tokens: 1024,
-          temperature: 0.3,
-          reasoning_format: "hidden",
-        }),
-        signal: AbortSignal.timeout(15000),
-      },
-    );
-    if (!res.ok) throw new Error("Groq error");
-    const data = await res.json() as { choices?: { message?: { content?: string } }[] };
-    return data.choices?.[0]?.message?.content?.trim() ?? buildFallbackSummary(params.target, params.score, params.risk, params.headers);
-  } catch {
-    return buildFallbackSummary(params.target, params.score, params.risk, params.headers);
-  }
+  const result = await callAI(prompt, 1024);
+  return result ?? buildFallbackSummary(params.target, params.score, params.risk, params.headers);
 }
 
 /* ─── HTML Comment & Leak Mining ─── */
@@ -988,17 +963,14 @@ async function getOsintData(targetUrl: string, isLiveUrl: boolean): Promise<Osin
   return { subdomains, dns, reverseIP, sharedHosting, wayback, ssl };
 }
 
-/* ─── AI helper: shared Groq caller ─── */
-async function callGroq(
-  promptOrMessages: string | { role: string; content: string }[],
-  maxTokens = 512
+/* ─── AI helper: unified caller (Groq-first, Gemini fallback) ─── */
+
+async function callGroqProvider(
+  messages: { role: string; content: string }[],
+  maxTokens: number,
+  key: string,
 ): Promise<string | null> {
-  const key = process.env.GROQ_API_KEY;
-  if (!key) return null;
   try {
-    const messages = typeof promptOrMessages === "string"
-      ? [{ role: "user", content: promptOrMessages }]
-      : promptOrMessages;
     const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: { "Authorization": `Bearer ${key}`, "Content-Type": "application/json" },
@@ -1019,6 +991,70 @@ async function callGroq(
   }
 }
 
+async function callGeminiProvider(
+  promptOrMessages: string | { role: string; content: string }[],
+  maxTokens: number,
+  key: string,
+): Promise<string | null> {
+  try {
+    let systemInstruction: string | null = null;
+    let contents: { role: string; parts: { text: string }[] }[];
+
+    if (typeof promptOrMessages === "string") {
+      contents = [{ role: "user", parts: [{ text: promptOrMessages }] }];
+    } else {
+      const sysMsg = promptOrMessages.find((m) => m.role === "system");
+      if (sysMsg) systemInstruction = sysMsg.content;
+      contents = promptOrMessages
+        .filter((m) => m.role !== "system")
+        .map((m) => ({
+          role: m.role === "assistant" ? "model" : "user",
+          parts: [{ text: m.content }],
+        }));
+    }
+
+    const body: Record<string, unknown> = {
+      contents,
+      generationConfig: { maxOutputTokens: maxTokens, temperature: 0.3 },
+    };
+    if (systemInstruction) {
+      body.system_instruction = { parts: [{ text: systemInstruction }] };
+    }
+
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${key}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(20000),
+      },
+    );
+    if (!res.ok) return null;
+    const data = await res.json() as { candidates?: { content?: { parts?: { text?: string }[] } }[] };
+    return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function callAI(
+  promptOrMessages: string | { role: string; content: string }[],
+  maxTokens = 512,
+): Promise<string | null> {
+  const groqKey = process.env.GROQ_API_KEY;
+  const geminiKey = process.env.GEMINI_API_KEY;
+
+  const messages =
+    typeof promptOrMessages === "string"
+      ? [{ role: "user", content: promptOrMessages }]
+      : promptOrMessages;
+
+  if (groqKey) return callGroqProvider(messages, maxTokens, groqKey);
+  if (geminiKey) return callGeminiProvider(promptOrMessages, maxTokens, geminiKey);
+  return null;
+}
+
 export const generateHeaderExplanation = createServerFn({ method: "POST" }).handler(
   async ({ data: rawData }) => {
     const { header, target, technologies } = rawData as unknown as { header: string; target: string; technologies: string[] };
@@ -1029,7 +1065,7 @@ In 2-3 sentences, explain:
 2. One concrete example of real-world exploitation
 
 Be specific, technical, and direct. Plain text only.`;
-    const result = await callGroq(prompt, 256);
+    const result = await callAI(prompt, 256);
     return { explanation: result ?? `${header} is missing, which leaves this endpoint vulnerable to related attacks. Implement this header following the recommendation shown above.` };
   },
 );
@@ -1048,7 +1084,7 @@ Identify which subdomains are HIGH INTEREST from an attacker's perspective (e.g.
 Respond with ONLY a JSON object in this exact format, no other text:
 {"flagged":["sub1.example.com","sub2.example.com"],"reasons":{"sub1.example.com":"staging environment","sub2.example.com":"admin interface"}}`;
     try {
-      const raw = await callGroq(prompt, 512);
+      const raw = await callAI(prompt, 512);
       if (!raw) return { flagged: [], reasons: {} };
       const jsonMatch = raw.match(/\{[\s\S]*\}/);
       if (!jsonMatch) return { flagged: [], reasons: {} };
@@ -1077,7 +1113,7 @@ Cookies detected:
 ${cookieSummary}
 
 In 2-3 sentences, explain the real-world security risk of the cookie configuration issues found. Be specific about what an attacker could do (XSS cookie theft, CSRF, session hijacking). Plain text only.`;
-    const result = await callGroq(prompt, 256);
+    const result = await callAI(prompt, 256);
     return { analysis: result };
   },
 );
@@ -1119,7 +1155,7 @@ Write a comprehensive security assessment report in markdown format with these s
 # Conclusion
 
 Make it professional, technical, and actionable. Use proper markdown formatting.`;
-    const result = await callGroq(prompt, 1500);
+    const result = await callAI(prompt, 1500);
     return { report: result ?? `# Security Assessment Report\n\n**Target:** ${scanData.target}\n**Score:** ${scanData.score}/100\n**Risk:** ${scanData.risk}\n\n## Summary\n\n${scanData.summary}` };
   },
 );
@@ -1144,7 +1180,7 @@ For each, provide:
 4. How to patch it
 
 Format this as a clean, readable Markdown response. Be technical and precise.`;
-    const result = await callGroq(prompt, 1024);
+    const result = await callAI(prompt, 1024);
     return { analysis: result };
   }
 );
@@ -1170,8 +1206,8 @@ Answer the user's questions clearly, technically, and precisely. If they ask for
       { role: "user", content: question },
     ];
     
-    const result = await callGroq(messages, 1024);
-    return { reply: result ?? "Error generating response." };
+    const result = await callAI(messages, 1024);
+    return { reply: result ?? "No AI provider configured. Set GROQ_API_KEY or GEMINI_API_KEY in your .env file." };
   }
 );
 
