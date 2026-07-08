@@ -362,40 +362,107 @@ async function probeSensitivePaths(
 
   const probeOne = async (
     entry: (typeof SENSITIVE_PATHS)[number],
-  ): Promise<SensitivePath> => {
+  ): Promise<SensitivePath & { _body?: string }> => {
     const url = `${base}${entry.path}`;
     try {
+      // Use redirect: "manual" — any redirect (301/302) counts as not-found.
+      // Only 200 = found, 401/403 = protected.
+      const needsBody = ["/.git/HEAD", "/.env", "/robots.txt"].includes(entry.path);
       const res = await fetch(url, {
-        method: "HEAD",
-        signal: AbortSignal.timeout(3000),
-        redirect: "follow",
+        method: needsBody ? "GET" : "HEAD",
+        signal: AbortSignal.timeout(5000),
+        redirect: "manual",
       });
       const s = res.status;
-      let status: SensitivePath["status"] = "not-found";
-      if (s === 200) status = "found";
-      else if (s === 401 || s === 403) status = "protected";
-      return { path: entry.path, label: entry.label, severity: entry.severity, status };
+
+      if (s === 401 || s === 403) {
+        return { path: entry.path, label: entry.label, severity: entry.severity, status: "protected" };
+      }
+
+      if (s !== 200) {
+        return { path: entry.path, label: entry.label, severity: entry.severity, status: "not-found" };
+      }
+
+      // s === 200 — for special paths, validate the body before marking as found.
+      if (needsBody) {
+        // Read at most 512 bytes to avoid large downloads.
+        const reader = res.body?.getReader();
+        let bodyChunk = "";
+        if (reader) {
+          const { value } = await reader.read();
+          reader.cancel();
+          bodyChunk = value ? new TextDecoder().decode(value.slice(0, 512)) : "";
+        }
+
+        if (entry.path === "/.git/HEAD") {
+          // Must contain the standard git HEAD ref line.
+          const isReal = /ref:\s*refs\/heads\//i.test(bodyChunk);
+          return {
+            path: entry.path,
+            label: entry.label,
+            severity: entry.severity,
+            status: isReal ? "found" : "not-found",
+          };
+        }
+
+        if (entry.path === "/.env") {
+          // Must contain at least one common env-file pattern.
+          const isReal = /(?:APP_|DB_|SECRET|KEY=|TOKEN=|PASSWORD=)/i.test(bodyChunk);
+          return {
+            path: entry.path,
+            label: entry.label,
+            severity: entry.severity,
+            status: isReal ? "found" : "not-found",
+          };
+        }
+
+        if (entry.path === "/robots.txt") {
+          // Must start with "User-agent:" (ignoring leading whitespace/BOM).
+          const isReal = /^\s*User-agent:/i.test(bodyChunk);
+          return {
+            path: entry.path,
+            label: entry.label,
+            severity: entry.severity,
+            status: isReal ? "found" : "not-found",
+            _body: isReal ? bodyChunk : undefined,
+          };
+        }
+      }
+
+      return { path: entry.path, label: entry.label, severity: entry.severity, status: "found" };
     } catch {
       return { path: entry.path, label: entry.label, severity: entry.severity, status: "not-found" };
     }
   };
 
-  const paths = await Promise.all(pathsToCheck.map(probeOne));
+  const rawPaths = await Promise.all(pathsToCheck.map(probeOne));
+  // Strip the internal _body field before returning.
+  const paths: SensitivePath[] = rawPaths.map(({ _body: _b, ...rest }) => rest);
 
   let robotsDisallowed: string[] = [];
-  const robotsResult = paths.find((p) => p.path === "/robots.txt");
-  if (robotsResult && robotsResult.status === "found") {
-    try {
-      const robotsRes = await fetch(`${base}/robots.txt`, { signal: AbortSignal.timeout(3000) });
-      if (robotsRes.ok) {
-        const text = await robotsRes.text();
-        robotsDisallowed = text
-          .split("\n")
-          .filter((line) => line.trim().toLowerCase().startsWith("disallow:"))
-          .map((line) => line.split(":")[1]?.trim())
-          .filter(Boolean) as string[];
-      }
-    } catch { /* ignore */ }
+  const robotsRaw = rawPaths.find((p) => p.path === "/robots.txt");
+  if (robotsRaw && robotsRaw.status === "found") {
+    // Reuse the body already fetched in probeOne if available.
+    const bodyText = (robotsRaw as { _body?: string })._body;
+    if (bodyText) {
+      robotsDisallowed = bodyText
+        .split("\n")
+        .filter((line) => line.trim().toLowerCase().startsWith("disallow:"))
+        .map((line) => line.split(":")[1]?.trim())
+        .filter(Boolean) as string[];
+    } else {
+      try {
+        const robotsRes = await fetch(`${base}/robots.txt`, { signal: AbortSignal.timeout(3000) });
+        if (robotsRes.ok) {
+          const text = await robotsRes.text();
+          robotsDisallowed = text
+            .split("\n")
+            .filter((line) => line.trim().toLowerCase().startsWith("disallow:"))
+            .map((line) => line.split(":")[1]?.trim())
+            .filter(Boolean) as string[];
+        }
+      } catch { /* ignore */ }
+    }
   }
 
   return { paths, robotsDisallowed };
@@ -542,7 +609,14 @@ async function generateAISummary(params: {
   technologies: { name: string; category: string }[]; headers: HeaderResult[];
 }): Promise<string> {
   const issues = params.headers.filter((h) => h.status !== "ok");
-  const prompt = `You are a senior penetration tester writing an executive summary for a security assessment report.
+  const messages = [
+    {
+      role: "system",
+      content: "You are a cybersecurity expert. Always complete your full response. Never truncate mid-sentence or mid-list. If you start listing CVEs, finish all of them.",
+    },
+    {
+      role: "user",
+      content: `You are a senior penetration tester writing an executive summary for a security assessment report.
 
 Target: ${params.target}
 Score: ${params.score}/100
@@ -557,8 +631,10 @@ Write a professional executive summary in 4-5 sentences covering:
 3. What these gaps mean for real-world risk
 4. Top priority actions to take
 
-Be specific and technical. Plain text only, no markdown, no bullet points, no headers.`;
-  const result = await callAI(prompt, 1024);
+Be specific and technical. Plain text only, no markdown, no bullet points, no headers.`,
+    },
+  ];
+  const result = await callAI(messages, 2048);
   return result ?? buildFallbackSummary(params.target, params.score, params.risk, params.headers);
 }
 
@@ -1000,8 +1076,9 @@ async function callGroqProvider(
         max_tokens: maxTokens,
         temperature: 0.3,
         reasoning_format: "hidden",
+        stop: null,
       }),
-      signal: AbortSignal.timeout(20000),
+      signal: AbortSignal.timeout(30000),
     });
     if (!res.ok) return null;
     const data = await res.json() as { choices?: { message?: { content?: string } }[] };
@@ -1078,14 +1155,23 @@ async function callAI(
 export const generateHeaderExplanation = createServerFn({ method: "POST" }).handler(
   async ({ data: rawData }) => {
     const { header, target, technologies } = rawData as unknown as { header: string; target: string; technologies: string[] };
-    const prompt = `You are a senior penetration tester. A security scan of ${target} (tech: ${technologies.join(", ") || "unknown"}) found that the ${header} HTTP security header is missing or misconfigured.
+    const messages = [
+      {
+        role: "system",
+        content: "You are a cybersecurity expert. Always complete your full response. Never truncate mid-sentence or mid-list. If you start listing CVEs, finish all of them.",
+      },
+      {
+        role: "user",
+        content: `You are a senior penetration tester. A security scan of ${target} (tech: ${technologies.join(", ") || "unknown"}) found that the ${header} HTTP security header is missing or misconfigured.
 
 In 2-3 sentences, explain:
 1. What specific attack becomes possible without this header on THIS type of target
 2. One concrete example of real-world exploitation
 
-Be specific, technical, and direct. Plain text only.`;
-    const result = await callAI(prompt, 256);
+Be specific, technical, and direct. Plain text only.`,
+      },
+    ];
+    const result = await callAI(messages, 512);
     return { explanation: result ?? `${header} is missing, which leaves this endpoint vulnerable to related attacks. Implement this header following the recommendation shown above.` };
   },
 );
@@ -1094,7 +1180,14 @@ export const triageSubdomains = createServerFn({ method: "POST" }).handler(
   async ({ data: rawData }) => {
     const { subdomains, domain } = rawData as unknown as { subdomains: string[]; domain: string };
     if (subdomains.length === 0) return { flagged: [], reasons: {} };
-    const prompt = `You are a penetration tester reviewing subdomains of ${domain}.
+    const messages = [
+      {
+        role: "system",
+        content: "You are a cybersecurity expert. Always complete your full response. Never truncate mid-sentence or mid-list. If you start listing CVEs, finish all of them.",
+      },
+      {
+        role: "user",
+        content: `You are a penetration tester reviewing subdomains of ${domain}.
 
 Subdomains found:
 ${subdomains.slice(0, 60).join("\n")}
@@ -1102,9 +1195,11 @@ ${subdomains.slice(0, 60).join("\n")}
 Identify which subdomains are HIGH INTEREST from an attacker's perspective (e.g., dev, staging, admin, internal, api, vpn, mail, test, jenkins, gitlab, jira, confluence, backup).
 
 Respond with ONLY a JSON object in this exact format, no other text:
-{"flagged":["sub1.example.com","sub2.example.com"],"reasons":{"sub1.example.com":"staging environment","sub2.example.com":"admin interface"}}`;
+{"flagged":["sub1.example.com","sub2.example.com"],"reasons":{"sub1.example.com":"staging environment","sub2.example.com":"admin interface"}}`,
+      },
+    ];
     try {
-      const raw = await callAI(prompt, 512);
+      const raw = await callAI(messages, 2048);
       if (!raw) return { flagged: [], reasons: {} };
       const jsonMatch = raw.match(/\{[\s\S]*\}/);
       if (!jsonMatch) return { flagged: [], reasons: {} };
@@ -1127,13 +1222,22 @@ export const analyzeCookiesAI = createServerFn({ method: "POST" }).handler(
     const cookieSummary = cookies
       .map((c) => `${c.name}: httpOnly=${c.httpOnly}, secure=${c.secure}, sameSite=${c.sameSite ?? "none"}, issues=${c.issues.length}`)
       .join("\n");
-    const prompt = `You are a web security expert. This is a ${endpoint} using ${technologies.join(", ") || "unknown tech"}.
+    const messages = [
+      {
+        role: "system",
+        content: "You are a cybersecurity expert. Always complete your full response. Never truncate mid-sentence or mid-list. If you start listing CVEs, finish all of them.",
+      },
+      {
+        role: "user",
+        content: `You are a web security expert. This is a ${endpoint} using ${technologies.join(", ") || "unknown tech"}.
 
 Cookies detected:
 ${cookieSummary}
 
-In 2-3 sentences, explain the real-world security risk of the cookie configuration issues found. Be specific about what an attacker could do (XSS cookie theft, CSRF, session hijacking). Plain text only.`;
-    const result = await callAI(prompt, 256);
+In 2-3 sentences, explain the real-world security risk of the cookie configuration issues found. Be specific about what an attacker could do (XSS cookie theft, CSRF, session hijacking). Plain text only.`,
+      },
+    ];
+    const result = await callAI(messages, 2048);
     return { analysis: result };
   },
 );
@@ -1152,7 +1256,14 @@ export const generateFullReport = createServerFn({ method: "POST" }).handler(
     };
     const issues = scanData.securityHeaders.filter((h) => h.status !== "ok");
     const exposedPaths = (scanData.sensitivePaths ?? []).filter((p) => p.status === "found");
-    const prompt = `You are a senior penetration tester writing a professional security assessment report.
+    const messages = [
+      {
+        role: "system",
+        content: "You are a cybersecurity expert. Always complete your full response. Never truncate mid-sentence or mid-list. If you start listing CVEs, finish all of them.",
+      },
+      {
+        role: "user",
+        content: `You are a senior penetration tester writing a professional security assessment report.
 
 Scan Results for: ${scanData.target}
 Security Score: ${scanData.score}/100 (${scanData.risk} Risk)
@@ -1174,8 +1285,10 @@ Write a comprehensive security assessment report in markdown format with these s
 # Remediation Roadmap
 # Conclusion
 
-Make it professional, technical, and actionable. Use proper markdown formatting.`;
-    const result = await callAI(prompt, 1500);
+Make it professional, technical, and actionable. Use proper markdown formatting.`,
+      },
+    ];
+    const result = await callAI(messages, 2048);
     return { report: result ?? `# Security Assessment Report\n\n**Target:** ${scanData.target}\n**Score:** ${scanData.score}/100\n**Risk:** ${scanData.risk}\n\n## Summary\n\n${scanData.summary}` };
   },
 );
@@ -1189,18 +1302,27 @@ export const analyzeVulnerabilities = createServerFn({ method: "POST" }).handler
     
     const techString = technologies.map(t => `${t.name} ${t.version || "(version unknown)"}`).join(", ");
     
-    const prompt = `You are an expert penetration tester. A scan of ${target} revealed the following technologies:
+    const messages = [
+      {
+        role: "system",
+        content: "You are a cybersecurity expert. Always complete your full response. Never truncate mid-sentence or mid-list. If you start listing CVEs, finish all of them.",
+      },
+      {
+        role: "user",
+        content: `You are an expert penetration tester. A scan of ${target} revealed the following technologies:
 ${techString}
 
-List the top 3-5 most critical known vulnerabilities (CVEs) associated with these specific technologies and versions (if version is unknown, list the most common critical CVEs for the technology in general).
-For each, provide:
+List ALL CVEs for each technology. Complete every entry fully including Description, Exploitation, and Patch. Do not stop mid-technology.
+For each CVE provide:
 1. The CVE ID
-2. A brief description of the vulnerability
-3. How an attacker might exploit it
-4. How to patch it
+2. A complete description of the vulnerability
+3. Exactly how an attacker would exploit it (include PoC approach if known)
+4. The exact patch or mitigation steps
 
-Format this as a clean, readable Markdown response. Be technical and precise.`;
-    const result = await callAI(prompt, 1024);
+Format as clean Markdown. Be technical and precise. Do not truncate any entry.`,
+      },
+    ];
+    const result = await callAI(messages, 2048);
     return { analysis: result };
   }
 );
@@ -1213,7 +1335,9 @@ export const askPentestAssistant = createServerFn({ method: "POST" }).handler(
       history: { role: string; content: string }[]
     };
     
-    const systemContent = `You are an expert penetration tester and security consultant. You are assisting a user in understanding and exploiting/remediating a security scan.
+    const systemContent = `You are a cybersecurity expert. Always complete your full response. Never truncate mid-sentence or mid-list. If you start listing CVEs, finish all of them.
+
+You are an expert penetration tester and security consultant. You are assisting a user in understanding and exploiting/remediating a security scan.
 
 Here is the summary of the scan results:
 ${scanSummary}
@@ -1226,7 +1350,7 @@ Answer the user's questions clearly, technically, and precisely. If they ask for
       { role: "user", content: question },
     ];
     
-    const result = await callAI(messages, 1024);
+    const result = await callAI(messages, 2048);
     return { reply: result ?? "No AI provider configured. Set GROQ_API_KEY or GEMINI_API_KEY in your .env file." };
   }
 );
