@@ -1152,8 +1152,7 @@ async function callAI(
   return null;
 }
 
-export const generateHeaderExplanation = createServerFn({ method: "POST" }).handler(
-  async ({ data: rawData }) => {
+export const generateHeaderExplanation = async (rawData: any) => {
     const { header, target, technologies } = rawData as unknown as { header: string; target: string; technologies: string[] };
     const messages = [
       {
@@ -1176,8 +1175,7 @@ Be specific, technical, and direct. Plain text only.`,
   },
 );
 
-export const triageSubdomains = createServerFn({ method: "POST" }).handler(
-  async ({ data: rawData }) => {
+export const triageSubdomains = async (rawData: any) => {
     const { subdomains, domain } = rawData as unknown as { subdomains: string[]; domain: string };
     if (subdomains.length === 0) return { flagged: [], reasons: {} };
     const messages = [
@@ -1211,8 +1209,7 @@ Respond with ONLY a JSON object in this exact format, no other text:
   },
 );
 
-export const analyzeCookiesAI = createServerFn({ method: "POST" }).handler(
-  async ({ data: rawData }) => {
+export const analyzeCookiesAI = async (rawData: any) => {
     const { cookies, endpoint, technologies } = rawData as unknown as {
       cookies: { name: string; httpOnly: boolean; secure: boolean; sameSite: string | null; issues: string[] }[];
       endpoint: string;
@@ -1242,8 +1239,7 @@ In 2-3 sentences, explain the real-world security risk of the cookie configurati
   },
 );
 
-export const generateFullReport = createServerFn({ method: "POST" }).handler(
-  async ({ data: rawData }) => {
+export const generateFullReport = async (rawData: any) => {
     const scanData = rawData as unknown as {
       target: string; score: number; risk: string; endpoint: string;
       technologies: { name: string; category: string }[];
@@ -1294,8 +1290,7 @@ Make it professional, technical, and actionable. Use proper markdown formatting.
 );
 
 
-export const analyzeVulnerabilities = createServerFn({ method: "POST" }).handler(
-  async ({ data: rawData }) => {
+export const analyzeVulnerabilities = async (rawData: any) => {
     const { technologies, target } = rawData as unknown as { technologies: { name: string; category: string; version?: string }[]; target: string };
     
     if (technologies.length === 0) return { analysis: "No specific technologies detected to check for vulnerabilities." };
@@ -1327,8 +1322,7 @@ Format as clean Markdown. Be technical and precise. Do not truncate any entry.`,
   }
 );
 
-export const askPentestAssistant = createServerFn({ method: "POST" }).handler(
-  async ({ data: rawData }) => {
+export const askPentestAssistant = async (rawData: any) => {
     const { question, scanSummary, history } = rawData as unknown as { 
       question: string; 
       scanSummary: string;
@@ -1356,8 +1350,7 @@ Answer the user's questions clearly, technically, and precisely. If they ask for
 );
 
 /* ─── Main server function ─── */
-export const analyzeTarget = createServerFn({ method: "POST" }).handler(
-  async ({ data: rawData }) => {
+export const analyzeTarget = async (rawData: any) => {
     const data = rawData as { url?: string; rawHttp?: string } | undefined;
     console.log("SERVER FN CALLED", data);
     const t0 = Date.now();
